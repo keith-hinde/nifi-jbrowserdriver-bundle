@@ -16,7 +16,9 @@
  */
 package uk.co.hindesight.nifi.processors.jbrowserdriver;
 
+import com.google.gson.Gson;
 import com.machinepublishers.jbrowserdriver.JBrowserDriver;
+import com.machinepublishers.jbrowserdriver.ProxyConfig;
 import com.machinepublishers.jbrowserdriver.Settings;
 import com.machinepublishers.jbrowserdriver.Timezone;
 import org.apache.nifi.annotation.behavior.*;
@@ -25,6 +27,7 @@ import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
@@ -32,12 +35,18 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.util.StandardValidators;
-import org.openqa.selenium.OutputType;
+import org.openqa.selenium.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.NoSuchElementException;
+import java.util.concurrent.TimeUnit;
+
+import static org.apache.commons.lang.StringUtils.trimToEmpty;
 
 @Tags({"jbrowserdriver","http","https","javascript","browser"})
 @CapabilityDescription("Invokes a JBrowserDriver HTTP request")
@@ -58,7 +67,54 @@ public class InvokeBrowserHTTP extends AbstractProcessor {
             .name("Remote URL")
             .description("Example Property")
             .required(true)
+            .expressionLanguageSupported(true)
+            .addValidator(StandardValidators.URL_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_ACTIONS = new PropertyDescriptor.Builder()
+            .name("Page Actions")
+            .description("Actions")
+            .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_SCREENSHOT = new PropertyDescriptor.Builder()
+            .name("Grab Screenshot")
+            .description("Blah blah")
+            .required(false)
+            .defaultValue("False")
+            .allowableValues("True", "False")
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_CONNECT_TIMEOUT = new PropertyDescriptor.Builder()
+            .name("Connection Timeout")
+            .description("Connection timeout.")
+            .required(true)
+            .defaultValue("5 secs")
+            .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_SOCKET_TIMEOUT = new PropertyDescriptor.Builder()
+            .name("Socket Timeout")
+            .description("Socket timeout.")
+            .required(true)
+            .defaultValue("5 secs")
+            .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_PROXY_HOST = new PropertyDescriptor.Builder()
+            .name("Proxy Host")
+            .description("The fully qualified hostname or IP address of the proxy server")
+            .required(false)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PROP_PROXY_PORT = new PropertyDescriptor.Builder()
+            .name("Proxy Port")
+            .description("The port of the proxy server")
+            .required(false)
+            .addValidator(StandardValidators.PORT_VALIDATOR)
             .build();
 
     public static final Relationship REL_RESPONSE = new Relationship.Builder()
@@ -71,19 +127,35 @@ public class InvokeBrowserHTTP extends AbstractProcessor {
             .description("Screenshot output")
             .build();
 
+    public static final Relationship REL_FAILURE = new Relationship.Builder()
+            .name("Failure")
+            .description("Request failed")
+            .build();
+
     private List<PropertyDescriptor> descriptors;
 
     private Set<Relationship> relationships;
+
+    private JBrowserDriver driver;
+
+    private Gson gson;
 
     @Override
     protected void init(final ProcessorInitializationContext context) {
         final List<PropertyDescriptor> descriptors = new ArrayList<PropertyDescriptor>();
         descriptors.add(PROP_URL);
+        descriptors.add(PROP_SCREENSHOT);
+        descriptors.add(PROP_ACTIONS);
+        descriptors.add(PROP_CONNECT_TIMEOUT);
+        descriptors.add(PROP_SOCKET_TIMEOUT);
+        descriptors.add(PROP_PROXY_HOST);
+        descriptors.add(PROP_PROXY_PORT);
         this.descriptors = Collections.unmodifiableList(descriptors);
 
         final Set<Relationship> relationships = new HashSet<Relationship>();
         relationships.add(REL_RESPONSE);
         relationships.add(REL_SCREENSHOT);
+        relationships.add(REL_FAILURE);
         this.relationships = Collections.unmodifiableSet(relationships);
     }
 
@@ -99,41 +171,115 @@ public class InvokeBrowserHTTP extends AbstractProcessor {
 
     @OnScheduled
     public void onScheduled(final ProcessContext context) {
+        Settings.Builder settings = Settings.builder();
+        settings.timezone(Timezone.EUROPE_LONDON);
+        settings.headless(true);
+        settings.cache(true);
+        settings.connectTimeout(
+                context.getProperty(PROP_CONNECT_TIMEOUT)
+                        .asTimePeriod(TimeUnit.MILLISECONDS)
+                        .intValue()
+        );
+        settings.socketTimeout(
+                context.getProperty(PROP_SOCKET_TIMEOUT)
+                        .asTimePeriod(TimeUnit.MILLISECONDS)
+                        .intValue()
+        );
+        settings.ssl("trustanything");
+        settings.hostnameVerification(false);
+        settings.blockAds(true);
+        settings.ignoreDialogs(true);
+        settings.screen(new Dimension(1920,1600));
 
+        final String proxyHost = context.getProperty(PROP_PROXY_HOST).getValue();
+        final Integer proxyPort = context.getProperty(PROP_PROXY_PORT).asInteger();
+
+        if (proxyHost != null && proxyPort != null) {
+            ProxyConfig proxy = new ProxyConfig(ProxyConfig.Type.HTTP, proxyHost, proxyPort);
+            settings.proxy(proxy);
+        }
+
+        this.driver = new JBrowserDriver(settings.build());
+
+        this.gson = new Gson();
     }
 
     @Override
     public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
-        FlowFile flowFile = session.get();
-        if ( flowFile == null ) {
-            return;
-        }
+        FlowFile requestFlowFile = session.get();
 
-        JBrowserDriver driver = new JBrowserDriver(
-                Settings.builder()
-                .timezone(Timezone.EUROPE_LONDON)
-                .build()
-        );
-        driver.get(context.getProperty(PROP_URL).getValue());
-        byte[] screenshot = driver.getScreenshotAs(OutputType.BYTES);
+        final ComponentLog logger = getLogger();
+
+        final UUID txId = UUID.randomUUID();
 
         try {
-            InputStream is = new ByteArrayInputStream(screenshot);
-            FlowFile screenshotFlowFile = session.create(flowFile);
-            screenshotFlowFile = session.importFrom(is, screenshotFlowFile);
-            session.transfer(screenshotFlowFile, REL_SCREENSHOT);
-            is.close();
-        } catch (Exception e) {
+            final URL url = new URL(trimToEmpty(context.getProperty(PROP_URL).evaluateAttributeExpressions(requestFlowFile).getValue()));
+            logger.error(url.toString());
 
-        }
+            final Boolean takeScreenshot = context.getProperty(PROP_SCREENSHOT).evaluateAttributeExpressions(requestFlowFile).asBoolean();
 
-        try {
-            InputStream ss = new ByteArrayInputStream(driver.getPageSource().getBytes(StandardCharsets.UTF_8));
-            flowFile = session.importFrom(ss, flowFile);
-            session.transfer(flowFile, REL_RESPONSE);
-            ss.close();
-        } catch (Exception e) {
+            this.driver.get(url.toString());
 
+            // "//a[@data-q='reply-panel-reveal-btn']"
+            // "//div[@class='reveal-number']": "click"
+
+            if (this.driver.getStatusCode() == HttpURLConnection.HTTP_OK) {
+                final String actionJson = trimToEmpty(context.getProperty(PROP_ACTIONS).evaluateAttributeExpressions(requestFlowFile).getValue());
+                logger.error(actionJson);
+
+                if (!actionJson.isEmpty()) {
+                    try {
+                        Map<String, String> actions = gson.fromJson(actionJson, HashMap.class);
+                        for (String selector : actions.keySet()) {
+                            List<WebElement> webElements = driver.findElements(By.xpath(selector));
+                            if (!webElements.isEmpty()) {
+                                WebElement webElement = webElements.get(1);
+                                if (webElement != null) {
+                                    switch (actions.get(selector)) {
+                                        case "click":
+                                            webElement.click();
+                                            break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        logger.error(e.getMessage(), e);
+                    }
+                }
+
+                try {
+                    InputStream ss = new ByteArrayInputStream(driver.getPageSource().getBytes(StandardCharsets.UTF_8));
+                    requestFlowFile = session.importFrom(ss, requestFlowFile);
+                    session.transfer(requestFlowFile, REL_RESPONSE);
+                    ss.close();
+                } catch (Exception e) {
+                    logger.error(e.getMessage(), e);
+                }
+
+                if (takeScreenshot) {
+                    driver.executeScript("window.scrollTo(0, 0)");
+
+                    byte[] screenshot = this.driver.getScreenshotAs(OutputType.BYTES);
+
+                    try {
+                        InputStream is = new ByteArrayInputStream(screenshot);
+                        FlowFile screenshotFlowFile = session.create(requestFlowFile);
+                        screenshotFlowFile = session.importFrom(is, screenshotFlowFile);
+                        session.transfer(screenshotFlowFile, REL_SCREENSHOT);
+                        is.close();
+                    } catch (Exception e) {
+                        logger.error(e.getMessage(), e);
+                    }
+                }
+            } else if (this.driver.getStatusCode() >= HttpURLConnection.HTTP_INTERNAL_ERROR) {
+                // Server error - retryable
+            } else {
+                // Something else - not retryable
+            }
+        } catch (final Exception e) {
+            logger.error(e.getMessage(), e);
+        } finally {
         }
     }
 }
